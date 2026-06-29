@@ -998,23 +998,34 @@ async function dbGetOnce(path){
   }
 }
 
-async function dbUpdate(updates){
-  try{
-    await db.ref().update(updates);
-    // cache ใน LS ด้วย
-    Object.entries(updates).forEach(([path, val])=>{
-      if(val === null) lsDel(path); else lsSet(path, val);
-    });
-  }catch(e){
-    if(e.code === 'PERMISSION_DENIED' || String(e.message).includes('Permission denied')){
-      console.warn('[dbUpdate] PERMISSION_DENIED — saving to localStorage fallback');
+async function dbUpdate(updates, retries=3){
+  let lastErr;
+  for(let attempt = 0; attempt <= retries; attempt++){
+    try{
+      await db.ref().update(updates);
+      // cache ใน LS ด้วย
       Object.entries(updates).forEach(([path, val])=>{
         if(val === null) lsDel(path); else lsSet(path, val);
       });
-      return; // ไม่ throw — ให้ทำงานต่อได้
+      return; // สำเร็จ
+    }catch(e){
+      lastErr = e;
+      if(e.code === 'PERMISSION_DENIED' || String(e.message).includes('Permission denied')){
+        console.warn('[dbUpdate] PERMISSION_DENIED — saving to localStorage fallback');
+        Object.entries(updates).forEach(([path, val])=>{
+          if(val === null) lsDel(path); else lsSet(path, val);
+        });
+        return; // ไม่ throw — ให้ทำงานต่อได้
+      }
+      // Network error / timeout — retry ด้วย exponential backoff
+      if(attempt < retries){
+        const delay = 300 * Math.pow(2, attempt); // 300ms, 600ms, 1200ms
+        console.warn(`[dbUpdate] attempt ${attempt+1} failed (${e.message}) — retrying in ${delay}ms`);
+        await new Promise(r => setTimeout(r, delay));
+      }
     }
-    throw e;
   }
+  throw lastErr;
 }
 
 async function dbSet(path, val){
@@ -1270,6 +1281,11 @@ let CURRENT_META  = null;
 let DIRTY = { FRESH:false, TRANSFER:false, NONFRESH:false };
 let CURRENT_ACTIVE = true; // default: true เพื่อให้บันทึกได้ทันที (admin ต้องกด Inactive ถึงจะล็อก)
 
+// ============================================================
+// CONCURRENCY GUARD — ป้องกันการบันทึกซ้ำซ้อนพร้อมกัน
+// ============================================================
+let SAVE_IN_PROGRESS = false;  // lock: กันกด Save ซ้ำหรือกดพร้อมกันในหน้าเดียวกัน
+
 /* ---------- Month Active helpers ---------- */
 async function getActiveMonths(){
   const data = await dbGetOnce('settings/months') || {};
@@ -1376,6 +1392,9 @@ async function renderEntryView(){
 async function loadMonthData(){
   const wrap = document.getElementById('entryTableWrap');
   if(wrap) wrap.innerHTML = '<div style="padding:24px;text-align:center;color:var(--text-soft)">กำลังโหลดข้อมูล...</div>';
+
+  // รีเซ็ต save lock เมื่อโหลดข้อมูลเดือนใหม่
+  SAVE_IN_PROGRESS = false;
 
   // Step 1: แสดงตารางจาก embedded data ทันที (ไม่รอ Firebase)
   CURRENT_DATA = { FRESH:{}, TRANSFER:{}, NONFRESH:{} };
@@ -1596,7 +1615,13 @@ function updateTabDots(){
    SAVE (Monthly)
 ============================================================ */
 async function saveCategory(){
-  // ใช้ค่า CURRENT_ACTIVE ที่ cache ไว้ (เร็วกว่า re-check Firebase)
+  // ── CONCURRENCY GUARD: ป้องกันกด Save ซ้ำหรือ double-tap บนมือถือ ──
+  if(SAVE_IN_PROGRESS){
+    toast('กำลังบันทึกอยู่ กรุณารอสักครู่...', 'default');
+    return;
+  }
+
+  // ── ตรวจ active จาก cache ก่อน (เร็ว) ──
   if(!CURRENT_ACTIVE){
     toast('เดือนนี้ยังไม่เปิดรับการบันทึก กรุณาติดต่อ Admin', 'error');
     return;
@@ -1651,9 +1676,29 @@ async function saveCategory(){
     return;
   }
 
+  // ── SET LOCK ก่อน async operation ──
+  SAVE_IN_PROGRESS = true;
   const btn = document.getElementById('saveEntryBtn');
   setLoading(btn, true, 'กำลังบันทึก...');
+
   try{
+    // ── RE-VERIFY active status จาก Firebase ก่อน write จริง ──
+    // ป้องกันกรณี admin ปิดเดือนระหว่างที่สาขากำลังกรอกข้อมูล
+    try{
+      await loadMonthsCache();
+      const stillActive = isMonthActiveSync(CURRENT_MONTH);
+      if(!stillActive){
+        CURRENT_ACTIVE = false;
+        renderEntryStatusBanner(false);
+        if(btn) btn.disabled = true;
+        toast('เดือนนี้ถูกปิดการบันทึกโดย Admin กรุณาติดต่อผู้ดูแลระบบ', 'error');
+        return;
+      }
+    }catch(verifyErr){
+      // ถ้า Firebase ขัดข้องระหว่าง verify ให้ใช้ค่า cache เดิม (ไม่ block การบันทึก)
+      console.warn('[saveCategory] re-verify error (using cached status):', verifyErr.message);
+    }
+
     updates[`counts/${key}/${SESSION.storeCode}/_meta`] = {
       storeName: SESSION.storeName,
       locNo: SESSION.locNo,
@@ -1683,6 +1728,7 @@ async function saveCategory(){
     console.error(err);
     toast('เกิดข้อผิดพลาดในการบันทึก: ' + err.message, 'error');
   }finally{
+    SAVE_IN_PROGRESS = false;  // ── RELEASE LOCK เสมอ ──
     setLoading(btn, false);
   }
 }
@@ -3363,11 +3409,31 @@ function ensureItemsSeeded(){
   });
   console.log('[ensureItemsSeeded] Loaded', ITEMS_DATA.length, 'items from embedded data instantly');
 
-  // Step 2: Seed to Firebase in background (fire-and-forget, ไม่รอ)
+  // Step 2: Seed to Firebase in background — เพิ่ม random jitter เพื่อกระจาย load
+  // เมื่อหลายสาขา login พร้อมกัน แต่ละ client จะ seed คนละเวลา ลด Firebase write contention
+  const jitter = 2000 + Math.floor(Math.random() * 3000); // 2–5 วิ แบบสุ่ม
   setTimeout(async ()=>{
     try{
       const existing = await dbGetOnce('items');
-      if(existing && Object.keys(existing).length > 0) return;
+      // ถ้ามีข้อมูลแล้ว (ไม่ว่าจะมีแค่ FRESH เดียวก็ถือว่า seed แล้ว) ให้ skip
+      if(existing && (existing.FRESH || existing.TRANSFER || existing.NONFRESH)){
+        const total = Object.values(existing).reduce((s,cat)=> s + Object.keys(cat||{}).length, 0);
+        if(total > 0){
+          console.log('[ensureItemsSeeded] Firebase already has items — skip seed');
+          return;
+        }
+      }
+      // Double-check: อ่านอีกครั้งก่อน write เพื่อป้องกัน race condition
+      // (สาขาอื่นอาจ seed ไปในระหว่างที่เรารอ jitter)
+      await new Promise(r => setTimeout(r, 200));
+      const recheck = await dbGetOnce('items');
+      if(recheck && (recheck.FRESH || recheck.TRANSFER || recheck.NONFRESH)){
+        const total2 = Object.values(recheck).reduce((s,cat)=> s + Object.keys(cat||{}).length, 0);
+        if(total2 > 0){
+          console.log('[ensureItemsSeeded] Race condition detected — items already seeded by another client, skip');
+          return;
+        }
+      }
       const updates = {};
       let c2 = { FRESH:0, TRANSFER:0, NONFRESH:0 };
       ITEMS_DATA.forEach(item=>{
@@ -3384,7 +3450,7 @@ function ensureItemsSeeded(){
     }catch(e){
       console.warn('[ensureItemsSeeded] Firebase seed error (non-fatal):', e.message);
     }
-  }, 2000); // หน่วง 2 วิ เพื่อไม่แข่งกับ UI load
+  }, jitter); // random jitter 2–5 วิ เพื่อกระจาย concurrent seed requests
 }
 
 async function loadItemsFromDB(){
